@@ -206,6 +206,14 @@ pub unsafe fn switch_arch_hook() {
         }
         match next_addrsp_guard {
             Some(next_addrsp) => {
+                #[cfg(target_arch = "mips64")]
+                if let Some(wrapper) = &*percpu.current_addrsp.borrow() {
+                    crate::arch::paging::switch_to(
+                        &wrapper.used_by as *const _ as usize,
+                        next_addrsp.table.utable.table().phys().data(),
+                    );
+                }
+                #[cfg(not(target_arch = "mips64"))]
                 next_addrsp.table.utable.make_current();
                 drop(next_addrsp);
             }

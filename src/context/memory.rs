@@ -99,11 +99,17 @@ pub struct AddrSpaceWrapper {
 }
 impl AddrSpaceWrapper {
     pub fn new() -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+        let this = Arc::new(Self {
             inner: RwLock::new(AddrSpace::new()?),
             tlb_ack: AtomicU32::new(0),
             used_by: LogicalCpuSet::empty(),
-        }))
+        });
+        // The key of this space's TLB identifier is the address of
+        // `used_by`. A space that died at this address may have left
+        // entries under it.
+        #[cfg(target_arch = "mips64")]
+        crate::arch::paging::retire(&this.used_by as *const _ as usize);
+        Ok(this)
     }
     pub fn acquire_read<'a>(
         &'a self,
@@ -389,7 +395,11 @@ impl AddrSpaceWrapper {
             }
             _ => {
                 dst.grants
-                    .find_free(dst.mmap_min, cmp::max(new_page_count, src_span.count))
+                    .find_free_near(
+                        dst.mmap_min,
+                        cmp::max(new_page_count, src_span.count),
+                        Some(src_span.base),
+                    )
                     .ok_or(Error::new(ENOMEM))?
                     .base
             }
@@ -693,6 +703,29 @@ impl AddrSpace {
         map: impl FnOnce(Page, PageFlags<RmmA>, &mut PageMapper, &mut Flusher) -> Result<Grant>,
     ) -> Result<Page> {
         self.mmap(dst_lock, None, page_count, flags, None, map)
+    }
+    /// Map at a free place chosen by the kernel that has the cache colour
+    /// of `near` where caches are virtually indexed.
+    pub fn mmap_near(
+        &mut self,
+        dst_lock: &AddrSpaceWrapper,
+        near: Page,
+        page_count: NonZeroUsize,
+        flags: MapFlags,
+        map: impl FnOnce(Page, PageFlags<RmmA>, &mut PageMapper, &mut Flusher) -> Result<Grant>,
+    ) -> Result<Page> {
+        let span = self
+            .grants
+            .find_free_near(self.mmap_min, page_count.get(), Some(near))
+            .ok_or(Error::new(ENOMEM))?;
+        self.mmap(
+            dst_lock,
+            Some(span.base),
+            page_count,
+            flags | MapFlags::MAP_FIXED_NOREPLACE,
+            None,
+            map,
+        )
     }
     pub fn mmap(
         &mut self,
@@ -1029,6 +1062,30 @@ impl UserGrants {
                 usable_start + req_size <= hole_end
             })?;
         // Create new region
+        #[cfg(target_arch = "mips64")]
+        if let Some(near) = _near {
+            // Virtually indexed caches: put the region on the cache colour of
+            // `near`, the address these pages are known by elsewhere, when a
+            // hole has room for the shift (arch::cache).
+            let colours = crate::arch::cache::colours();
+            let want = crate::arch::cache::colour(near.start_address().data());
+            let slack = (colours - 1) * PAGE_SIZE;
+            let found = self
+                .holes_by_size
+                .range((req_size + slack, VirtualAddress::new(0))..)
+                .find(|&&(hole_size, hole_offset)| {
+                    let usable_start = cmp::max(hole_offset.data(), min);
+                    usable_start + req_size + slack <= hole_offset.data() + hole_size
+                });
+            if let Some(&(_, hole_offset)) = found {
+                let start = cmp::max(hole_offset.data(), min);
+                let shift = (want + colours - crate::arch::cache::colour(start)) % colours;
+                return Some(PageSpan::new(
+                    Page::containing_address(VirtualAddress::new(start + shift * PAGE_SIZE)),
+                    page_count,
+                ));
+            }
+        }
         Some(PageSpan::new(
             Page::containing_address(VirtualAddress::new(cmp::max(hole_start.data(), min))),
             page_count,
@@ -1810,8 +1867,14 @@ impl Grant {
                     } else {
                         // TODO: Omit the unnecessary subsequent add_ref call.
                         let must_be_zero = true;
+                        #[cfg(target_arch = "mips64")]
+                        crate::arch::cache::set_alloc_colour(Some(
+                            src_page.start_address().data(),
+                        ));
                         let new_frame =
                             init_frame(RefCount::One, must_be_zero).expect("TODO: handle OOM");
+                        #[cfg(target_arch = "mips64")]
+                        crate::arch::cache::set_alloc_colour(None);
                         let src_flush = unsafe {
                             src_mapper
                                 .map_phys(src_page.start_address(), new_frame.base(), flags, 0)
@@ -2527,7 +2590,13 @@ fn map_zeroed(
     _writable: bool,
 ) -> Result<Frame, PfError> {
     let must_be_zero = true;
-    let new_frame = init_frame(RefCount::One, must_be_zero)?;
+    // Virtually indexed caches: ask for a frame on the page's colour.
+    #[cfg(target_arch = "mips64")]
+    crate::arch::cache::set_alloc_colour(Some(page.start_address().data()));
+    let new_frame = init_frame(RefCount::One, must_be_zero);
+    #[cfg(target_arch = "mips64")]
+    crate::arch::cache::set_alloc_colour(None);
+    let new_frame = new_frame?;
 
     unsafe {
         mapper
@@ -3035,6 +3104,12 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
             }
         }
 
+        // With address space identifiers the entries of a space that is
+        // not running stay in the TLB: drop this space's, current or not.
+        // `active_cpus` is the space's `used_by`, the key of its identifier.
+        #[cfg(target_arch = "mips64")]
+        crate::arch::paging::flush_space(self.active_cpus as *const _ as usize);
+        #[cfg(not(target_arch = "mips64"))]
         if self.active_cpus.contains(current_cpu_id) {
             rmm::PageFlushAll::<RmmA>::new().flush();
         }

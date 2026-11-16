@@ -1,4 +1,5 @@
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 #![allow(unexpected_cfgs)] // why does this even exist?
 
 #[cfg(test)]
@@ -20,6 +21,10 @@ mod arch;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "arch/x86_64.rs"]
+mod arch;
+
+#[cfg(target_arch = "mips64")]
+#[path = "arch/mips64.rs"]
 mod arch;
 
 /// Function definitions

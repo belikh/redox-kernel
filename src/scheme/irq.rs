@@ -24,6 +24,8 @@ use super::{CallerCtx, HandleMap, OpenResult, SchemeExt, StrOrBytes};
 use crate::arch::interrupt::{available_irqs_iter, irq::acknowledge, is_reserved, set_reserved};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::dtb::irqchip::{acknowledge, available_irqs_iter, is_reserved, set_reserved, IRQ_CHIP};
+#[cfg(target_arch = "mips64")]
+use crate::arch::interrupt::irq::{acknowledge, available_irqs_iter, is_reserved, set_reserved};
 use crate::{
     cpu_set::LogicalCpuId,
     event,

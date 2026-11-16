@@ -457,7 +457,8 @@ impl KernelScheme for ProcScheme {
                     #[cfg(any(
                         target_arch = "x86_64",
                         target_arch = "aarch64",
-                        target_arch = "riscv64"
+                        target_arch = "riscv64",
+                        target_arch = "mips64"
                     ))]
                     regs.set_arg1(arg1);
 
@@ -547,9 +548,12 @@ impl KernelScheme for ProcScheme {
                     // SAFETY: We've compared  Arc::ptr_eq(addrspace, dst_addr_space) before
                     let mut dst_addrsp_guard =
                         unsafe { dst_addr_space.acquire_rewrite(lock_token) };
+                    // With no address asked for, offer the source's as a hint:
+                    // on mips64 the pages then land on the source's cache
+                    // colour (Grants::find_free_near).
                     dst_addrsp_guard.mmap(
                         dst_addr_space,
-                        requested_dst_base,
+                        requested_dst_base.or(Some(src_span.base)),
                         src_page_count,
                         map.flags,
                         Some(&mut notify_files),

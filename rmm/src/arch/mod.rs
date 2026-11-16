@@ -9,7 +9,9 @@ pub mod aarch64;
 pub mod emulate;
 #[cfg(target_pointer_width = "64")]
 pub mod riscv64;
-#[cfg(target_pointer_width = "32")]
+#[cfg(target_arch = "mips64")]
+pub mod mips;
+#[cfg(all(target_pointer_width = "32", target_arch = "x86"))]
 pub mod x86;
 #[cfg(target_pointer_width = "64")]
 pub mod x86_64;

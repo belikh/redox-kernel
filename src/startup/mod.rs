@@ -19,14 +19,14 @@ pub mod memory;
 
 #[repr(C, packed(8))]
 pub(crate) struct KernelArgs {
-    kernel_base: u64,
-    kernel_size: u64,
+    pub(crate) kernel_base: u64,
+    pub(crate) kernel_size: u64,
 
-    stack_base: u64,
-    stack_size: u64,
+    pub(crate) stack_base: u64,
+    pub(crate) stack_size: u64,
 
-    env_base: u64,
-    env_size: u64,
+    pub(crate) env_base: u64,
+    pub(crate) env_size: u64,
 
     /// The base pointer to the saved RSDP or device tree blob.
     ///
@@ -39,13 +39,13 @@ pub(crate) struct KernelArgs {
     pub(crate) hwdesc_base: u64,
     pub(crate) hwdesc_size: u64,
 
-    areas_base: u64,
-    areas_size: u64,
+    pub(crate) areas_base: u64,
+    pub(crate) areas_size: u64,
 
     /// The physical base 64-bit pointer to the contiguous bootstrap/initfs.
-    bootstrap_base: u64,
+    pub(crate) bootstrap_base: u64,
     /// Size of contiguous bootstrap/initfs physical region, not necessarily page aligned.
-    bootstrap_size: u64,
+    pub(crate) bootstrap_size: u64,
 }
 
 impl KernelArgs {

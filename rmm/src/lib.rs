@@ -1,6 +1,7 @@
 #![no_std]
 #![allow(clippy::new_without_default)]
 #![feature(slice_shift)]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 
 use core::ops::AddAssign;
 

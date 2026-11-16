@@ -4,6 +4,7 @@
 //! provides Unix-like syscalls for primarily Rust applications
 
 #![feature(int_roundings)]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 #![cfg_attr(dtb, feature(iter_next_chunk))]
 #![feature(sync_unsafe_cell)]
 #![feature(btree_cursors)]

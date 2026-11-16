@@ -47,6 +47,10 @@ mod arch;
 #[path = "arch/riscv64.rs"]
 mod arch;
 
+#[cfg(target_arch = "mips64")]
+#[path = "arch/mips64.rs"]
+mod arch;
+
 /// Context struct
 pub mod context;
 

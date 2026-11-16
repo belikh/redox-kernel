@@ -54,6 +54,46 @@ pub(crate) fn areas() -> &'static [rmm::MemoryArea] {
     unsafe { &(&*AREAS.get())[..AREA_COUNT.get().read().into()] }
 }
 
+/// A reserved range that the allocator gets later: the boot image's copy of
+/// the initfs, which is dead once `usermode_bootstrap` has copied it into
+/// the first process. `init_sections` gives the range PageInfos, marked
+/// used and kept off the free lists; `release_late_area` frees it.
+/// Set before `init_mm`; (base, size), page aligned, size 0 for none.
+pub(crate) static LATE_AREA: SyncUnsafeCell<(usize, usize)> = SyncUnsafeCell::new((0, 0));
+
+fn late_area() -> Option<rmm::MemoryArea> {
+    let (base, size) = unsafe { LATE_AREA.get().read() };
+    (size != 0).then_some(rmm::MemoryArea {
+        base: PhysicalAddress::new(base),
+        size,
+    })
+}
+
+fn in_late_area(frame: Frame) -> bool {
+    late_area().is_some_and(|area| {
+        frame.base().data() >= area.base.data()
+            && frame.base().data() < area.base.data() + area.size
+    })
+}
+
+/// Hand the late area to the allocator. Call once, when nothing reads the
+/// range any more.
+pub unsafe fn release_late_area() {
+    let Some(area) = late_area() else { return };
+    let count = area.size / PAGE_SIZE;
+    // The frames were never allocated from a list: count them as used first,
+    // so that freeing them balances.
+    FREE_LISTS.get().unwrap()[0]
+        .free_list_inner
+        .lock()
+        .used_frames += count;
+    unsafe {
+        LATE_AREA.get().write((0, 0));
+        deallocate_contiguous(Frame::containing(area.base), count);
+    }
+    info!("Released {} KiB of boot image to the allocator", area.size / 1024);
+}
+
 /// Get the number of frames available
 pub fn free_frames() -> usize {
     total_frames() - used_frames()
@@ -142,7 +182,12 @@ pub fn allocate_p2frame(order: u32, must_be_zero: bool) -> Option<Frame> {
     None
 }
 pub fn allocate_frame(must_be_zero: bool) -> Option<Frame> {
-    allocate_p2frame(0, must_be_zero)
+    let frame = allocate_p2frame(0, must_be_zero)?;
+    // Virtually indexed caches: prefer a frame on the colour of the address
+    // it is being allocated for (arch::cache).
+    #[cfg(target_arch = "mips64")]
+    let frame = crate::arch::cache::recolour(frame, must_be_zero);
+    Some(frame)
 }
 
 // TODO: Flags, strategy
@@ -240,6 +285,8 @@ fn get_index_for_deallocation(addr: usize) -> Option<usize> {
 }
 
 pub unsafe fn deallocate_p2frame(orig_frame: Frame, order: u32) {
+    #[cfg(target_arch = "mips64")]
+    crate::arch::cache::forget(orig_frame, order);
     let index = if numa::is_supported() {
         get_index_for_deallocation(orig_frame.physaddr.get()).expect("Expected an index")
     } else {
@@ -385,6 +432,29 @@ fn allocate_frames(count: usize, alloc_order: impl FnOnce(u32) -> Option<Frame>)
         unsafe { deallocate_contiguous(base.next_by(count), rounded - count) };
     }
     Some(base)
+}
+
+/// One frame of cache colour `want`, cut from an aligned block of `colours`
+/// frames (a power of two), which holds one frame of every colour. The other
+/// frames go back to the allocator.
+#[cfg(target_arch = "mips64")]
+pub fn allocate_frame_of_colour(want: usize, colours: usize, must_be_zero: bool) -> Option<Frame> {
+    let base = allocate_p2frame(colours.trailing_zeros(), must_be_zero)?;
+    for i in 0..colours {
+        let info = get_page_info(base.next_by(i)).expect("allocated frame missing PageInfo");
+        info.refcount.store(RC_USED_NOT_FREE, Ordering::Relaxed);
+        info.next.store(0, Ordering::Relaxed);
+    }
+    let mut kept = None;
+    for i in 0..colours {
+        let frame = base.next_by(i);
+        if (frame.base().data() / PAGE_SIZE) & (colours - 1) == want {
+            kept = Some(frame);
+        } else {
+            unsafe { deallocate_p2frame(frame, 0) };
+        }
+    }
+    kept
 }
 
 // Helper function for quickly mapping device memory
@@ -785,7 +855,12 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
 
                 (aligned_end - aligned_start) / MAX_SECTION_SIZE
             })
-            .sum();
+            .sum::<usize>()
+            + late_area().map_or(0, |area| {
+                (area.base.add(area.size).data().next_multiple_of(MAX_SECTION_SIZE)
+                    - area.base.data() / MAX_SECTION_SIZE * MAX_SECTION_SIZE)
+                    / MAX_SECTION_SIZE
+            });
         let section_array_page_count =
             (max_section_count * size_of::<Section>()).div_ceil(PAGE_SIZE);
 
@@ -902,9 +977,22 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
         None
     };
 
+    if let Some(area) = late_area() {
+        sections_fill(&mut i, &[area]);
+    }
+
     let sections = &mut sections[..i];
 
     sections.sort_unstable_by_key(|s| s.base);
+
+    for section in sections.iter().filter(|s| in_late_area(s.base)) {
+        for page_info in section.frames.iter() {
+            page_info
+                .refcount
+                .store(RC_USED_NOT_FREE, Ordering::Relaxed);
+            page_info.next.store(0, Ordering::Relaxed);
+        }
+    }
 
     // The bump allocator has been used during the section array and page info array allocation
     // phases, which means some of the PageInfos will be pointing to those arrays themselves.
@@ -976,6 +1064,9 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
                 && (section.base.physaddr.get() < region.base.data()
                     || section.base.physaddr.get() >= region.base.data() + region.size)
             {
+                continue;
+            }
+            if in_late_area(section.base) {
                 continue;
             }
 
@@ -1412,7 +1503,13 @@ pub fn page_fault_handler(
         let mut token = unsafe { CleanLockToken::new() };
         match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
             Ok(()) => return Ok(()),
-            Err(PfError::Oom) => todo!("oom"),
+            // Out of frames: fail this fault. A fault from user mode kills
+            // the process, which returns its memory; a usercopy fault makes
+            // the syscall fail with EFAULT. Upstream has `todo!("oom")` here,
+            // a kernel panic.
+            Err(PfError::Oom) => {
+                warn!("out of memory: page fault at {:#x} not served", faulting_address.data());
+            }
             Err(PfError::Segv | PfError::RecursionLimitExceeded) => (),
             Err(PfError::NonfatalInternalError) => todo!(),
         }

@@ -233,8 +233,8 @@ impl Context {
             sched_cpu_time: 0,
             sched_affinity: LogicalCpuSet::all(),
             inside_syscall: false,
-            syscall_head: SyscallFrame::Free(RaiiFrame::allocate()?),
-            syscall_tail: SyscallFrame::Free(RaiiFrame::allocate()?),
+            syscall_head: SyscallFrame::Free(syscall_frame(0)?),
+            syscall_tail: SyscallFrame::Free(syscall_frame(PAGE_SIZE)?),
             wake: None,
             arch: arch::Context::new(),
             kfx: AlignedBox::<[u8], { arch::KFX_ALIGN }>::try_zeroed_slice(crate::arch::kfx_size())?,
@@ -412,6 +412,14 @@ impl Context {
                 Some(ref new) => {
                     new.used_by.atomic_set(this_percpu.cpu_id);
                     let new_addrsp = new.acquire_read(token);
+                    #[cfg(target_arch = "mips64")]
+                    unsafe {
+                        crate::arch::paging::switch_to(
+                            &new.used_by as *const _ as usize,
+                            new_addrsp.table.utable.table().phys().data(),
+                        );
+                    }
+                    #[cfg(not(target_arch = "mips64"))]
                     unsafe {
                         new_addrsp.table.utable.make_current();
                     }
@@ -487,6 +495,18 @@ impl Context {
     }
 }
 
+/// A frame for the syscall head or tail buffer, on the cache colour of
+/// `_colour_of` where caches are virtually indexed: the two buffers of a
+/// context start on neighbouring colours (BorrowedHtBuf::take).
+fn syscall_frame(_colour_of: usize) -> Result<RaiiFrame, Enomem> {
+    #[cfg(target_arch = "mips64")]
+    crate::arch::cache::set_alloc_colour(Some(_colour_of));
+    let frame = RaiiFrame::allocate();
+    #[cfg(target_arch = "mips64")]
+    crate::arch::cache::set_alloc_colour(None);
+    frame
+}
+
 /// Wrapper struct for borrowing the syscall head or tail buf.
 #[derive(Debug)]
 pub struct BorrowedHtBuf {
@@ -495,32 +515,65 @@ pub struct BorrowedHtBuf {
 }
 impl BorrowedHtBuf {
     pub fn head_locked(token: LockToken<L3>) -> Result<Self> {
-        let current = context::current();
-        let frame = &mut current.write(token).syscall_head;
-        match mem::replace(frame, SyscallFrame::Dummy) {
-            SyscallFrame::Free(free_frame) => {
-                *frame = SyscallFrame::Used {
-                    _frame: free_frame.get(),
-                };
-                Ok(Self {
-                    inner: Some(free_frame),
-                    head_and_not_tail: true,
-                })
-            }
-            SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
-        }
+        Self::take(token, true, None)
     }
     pub fn tail_locked(token: LockToken<L3>) -> Result<Self> {
+        Self::take(token, false, None)
+    }
+    /// The head buffer, to be mapped at a user page of the cache colour of
+    /// `user_addr`.
+    pub fn head_locked_at(token: LockToken<L3>, user_addr: usize) -> Result<Self> {
+        Self::take(token, true, Some(user_addr))
+    }
+    /// The tail buffer, to be mapped at a user page of the cache colour of
+    /// `user_addr`.
+    pub fn tail_locked_at(token: LockToken<L3>, user_addr: usize) -> Result<Self> {
+        Self::take(token, false, Some(user_addr))
+    }
+    fn take(token: LockToken<L3>, head: bool, _user_addr: Option<usize>) -> Result<Self> {
         let current = context::current();
-        let frame = &mut current.write(token).syscall_tail;
-        match mem::replace(frame, SyscallFrame::Dummy) {
+        let mut guard = current.write(token);
+        let context = &mut *guard;
+        let (slot, _other) = if head {
+            (&mut context.syscall_head, &mut context.syscall_tail)
+        } else {
+            (&mut context.syscall_tail, &mut context.syscall_head)
+        };
+        // Virtually indexed caches (arch::cache): the kernel fills this frame
+        // through kseg0 and the scheme reads it at a user page. On different
+        // colours every call costs two write-backs of the page's cache lines
+        // and a refill trap. The two frames of a context start on different
+        // colours, so the other one usually fits; otherwise the frame is
+        // exchanged for one of the wanted colour.
+        #[cfg(target_arch = "mips64")]
+        if let Some(addr) = _user_addr {
+            use crate::arch::cache::colour;
+            let want = colour(addr);
+            let fits = |slot: &SyscallFrame| match slot {
+                SyscallFrame::Free(frame) => Some(colour(frame.get().base().data()) == want),
+                _ => None,
+            };
+            if fits(&*slot) == Some(false) {
+                if fits(&*_other) == Some(true) {
+                    mem::swap(slot, _other);
+                } else {
+                    crate::arch::cache::set_alloc_colour(Some(addr));
+                    let fresh = RaiiFrame::allocate();
+                    crate::arch::cache::set_alloc_colour(None);
+                    if let Ok(fresh) = fresh {
+                        *slot = SyscallFrame::Free(fresh);
+                    }
+                }
+            }
+        }
+        match mem::replace(slot, SyscallFrame::Dummy) {
             SyscallFrame::Free(free_frame) => {
-                *frame = SyscallFrame::Used {
+                *slot = SyscallFrame::Used {
                     _frame: free_frame.get(),
                 };
                 Ok(Self {
                     inner: Some(free_frame),
-                    head_and_not_tail: false,
+                    head_and_not_tail: head,
                 })
             }
             SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),

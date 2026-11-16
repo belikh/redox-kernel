@@ -25,3 +25,9 @@ mod x86_shared;
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::*;
+
+#[cfg(target_arch = "mips64")]
+#[macro_use]
+pub mod mips64;
+#[cfg(target_arch = "mips64")]
+pub use self::mips64::*;

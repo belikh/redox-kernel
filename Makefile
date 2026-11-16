@@ -18,6 +18,11 @@ ifeq ($(ARCH),riscv64gc)
 else ifeq ($(ARCH),i686)
 	override ARCH:=i586
 	GNU_TARGET=i686-unknown-redox
+else ifeq ($(ARCH),mips64)
+	# SGI Indy: no GNU binutils for the target; llvm-objcopy comes with the toolchain.
+	GNU_TARGET=mips64-sgi-redox
+	OBJCOPY?=llvm-objcopy
+	KERNEL_CARGO_FLAGS?=--no-default-features
 else
 	GNU_TARGET=$(ARCH)-unknown-redox
 endif
@@ -32,6 +37,7 @@ MANIFEST=$(SOURCE)/Cargo.toml
 TARGET_SPEC=$(RUST_TARGET_PATH)/$(ARCH)-unknown-kernel.json
 
 KERNEL_CARGO_FEATURES?=
+KERNEL_CARGO_FLAGS?=
 
 $(BUILD):
 	mkdir -p "$@"
@@ -45,6 +51,7 @@ $(BUILD)/kernel.all: $(LD_SCRIPT) $(LOCKFILE) $(MANIFEST) $(TARGET_SPEC) $(shell
 		-Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem \
 		-Z json-target-spec \
 		--features=$(KERNEL_CARGO_FEATURES) \
+		$(KERNEL_CARGO_FLAGS) \
 		-- \
 		-C link-arg=-T -Clink-arg="$(LD_SCRIPT)" \
 		-C link-arg=-z -Clink-arg=max-page-size=0x1000 \

@@ -83,6 +83,21 @@ pub unsafe fn stack_trace() {
         let mapper = KernelMapper::lock_ro();
 
         let kernel_ptr = crate::kernel_executable_offsets::KERNEL_OFFSET() as *const u8;
+        // A firmware that loads the kernel as a flat image (the SGI PROM
+        // loads ECOFF) leaves no ELF header to read symbols from.
+        if slice::from_raw_parts(kernel_ptr, 4) != elf::ELFMAG {
+            println!("TRACE: no ELF header at KERNEL_OFFSET, no symbols");
+            let mut frame = StackTrace::start();
+            for _ in 0..64 {
+                if let Some(frame_) = frame {
+                    println!("  {:>016x}", *frame_.pc_ptr);
+                    frame = frame_.next();
+                } else {
+                    break;
+                }
+            }
+            return;
+        }
         let elf_header: &FileHeader<NativeEndian> = object::pod::from_bytes(slice::from_raw_parts(
             kernel_ptr,
             size_of::<FileHeader<NativeEndian>>(),

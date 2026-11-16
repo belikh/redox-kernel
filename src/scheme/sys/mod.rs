@@ -31,6 +31,8 @@ mod cpu;
 mod exe;
 mod fdstat;
 mod iostat;
+#[cfg(target_arch = "mips64")]
+mod kdbg;
 mod irq;
 mod log;
 #[cfg(all(feature = "numa", target_arch = "x86_64"))]
@@ -86,6 +88,12 @@ const FILES: &[(&str, Kind)] = &[
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     ("spurious_irq", Rd(interrupt::irq::spurious_irq_resource)),
     ("stat", Rd(stat::resource)),
+    #[cfg(target_arch = "mips64")]
+    ("kdbg_ctx", Rd(kdbg::contexts_resource)),
+    #[cfg(target_arch = "mips64")]
+    ("kdbg_mem", Rd(kdbg::mem_resource)),
+    #[cfg(target_arch = "mips64")]
+    ("kdbg_req", Wr(kdbg::mem_request)),
     // Disabled because the debugger is inherently unsafe and probably will break the system.
     /*
     ("trigger_debugger", Rd(|token| unsafe {
@@ -103,6 +111,37 @@ const FILES: &[(&str, Kind)] = &[
             match arg.trim_ascii() {
                 b"shutdown" => crate::stop::kstop(token),
                 b"reset" => crate::stop::kreset(),
+                // The Indy's boot deadman (arch::time): a remote test image
+                // reboots by itself unless this arrives in time.
+                #[cfg(target_arch = "mips64")]
+                b"profile" => {
+                    crate::arch::time::profile_log();
+                    Ok(0)
+                }
+                #[cfg(target_arch = "mips64")]
+                [b'p', b'r', b'o', b'f', b'i', b'l', b'e', b'=', a, b, c, d] => {
+                    crate::arch::time::profile_program([*a, *b, *c, *d]);
+                    Ok(arg.len())
+                }
+                #[cfg(target_arch = "mips64")]
+                b"cachestat" => {
+                    crate::arch::cache::log_stats();
+                    Ok(0)
+                }
+                // The CPU module's secondary cache (arch::cache::scache).
+                #[cfg(target_arch = "mips64")]
+                b"scache-on" | b"scache-off" => {
+                    if crate::arch::cache::scache(arg.trim_ascii() == b"scache-on") {
+                        Ok(arg.len())
+                    } else {
+                        Err(Error::new(EINVAL))
+                    }
+                }
+                #[cfg(target_arch = "mips64")]
+                b"disarm" => {
+                    crate::arch::time::disarm_deadman();
+                    Ok(0)
+                }
                 b"emergency_reset" => crate::stop::emergency_reset(),
                 _ => Err(Error::new(EINVAL)),
             }

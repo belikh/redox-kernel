@@ -430,8 +430,12 @@ impl UserInner {
 
             dst_addr_space
                 .acquire_write(lock_token.downgrade())
-                .mmap_anywhere(
+                .mmap_near(
                     &dst_addr_space,
+                    // Any address of the frame's cache colour (mips64).
+                    Page::containing_address(VirtualAddress::new(
+                        tail_frame.base().data() % (16 * PAGE_SIZE),
+                    )),
                     ONE,
                     PROT_READ,
                     |dst_page, flags, mapper, flusher| {
@@ -557,7 +561,8 @@ impl UserInner {
 
         let head_buf_opt = if !head_part_of_buf.is_empty() {
             // FIXME: Signal context can probably recursively use head/tail.
-            let mut array = BorrowedHtBuf::head_locked(token.downgrade())?;
+            let mut array =
+                BorrowedHtBuf::head_locked_at(token.downgrade(), src_page.start_address().data())?;
             if READ {
                 array.buf_mut()[..offset].fill(0_u8);
                 array.buf_mut()[offset + head_len..].fill(0_u8);
@@ -576,7 +581,10 @@ impl UserInner {
 
         let tail_buf_opt = if !tail_part_of_buf.is_empty() {
             // FIXME: Signal context can probably recursively use head/tail.
-            let mut array = BorrowedHtBuf::tail_locked(token.downgrade())?;
+            let mut array = BorrowedHtBuf::tail_locked_at(
+                token.downgrade(),
+                src_page.next_by(page_count - 1).start_address().data(),
+            )?;
 
             if READ {
                 let (to_copy, to_zero) = array.buf_mut().split_at_mut(tail_size);
@@ -597,9 +605,11 @@ impl UserInner {
         let mut dst_space_guard = dst_space_lock.acquire_write(token.downgrade());
         let (dst_space, _token_split) = dst_space_guard.token_split();
 
+        // The pages are laid out as in the source, so starting on the source's
+        // cache colour keeps every borrowed page on its own colour (mips64).
         let free_span = dst_space
             .grants
-            .find_free(dst_space.mmap_min, page_count)
+            .find_free_near(dst_space.mmap_min, page_count, Some(src_page))
             .ok_or(Error::new(ENOMEM))?;
 
         let head = if let Some(array) = head_buf_opt {
