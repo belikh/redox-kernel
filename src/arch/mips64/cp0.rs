@@ -40,6 +40,9 @@ pub mod status {
     /// Bootstrap exception vectors (PROM) when set.
     pub const BEV: u32 = 1 << 22;
     pub const CU1: u32 = 1 << 29;
+    /// 32 64-bit floating-point registers (FR=1). The userland is built for
+    /// FR=1 (n32 and LLVM mips3), so the kernel must set this with CU1.
+    pub const FR: u32 = 1 << 26;
 }
 
 /// Cause register bits.

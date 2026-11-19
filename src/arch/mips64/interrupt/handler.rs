@@ -112,6 +112,7 @@ impl InterruptStack {
         // are reserved in user mode without it. With UX set, user TLB misses
         // arrive at the XTLB refill vector, which has the same stub.
         self.iret.status = (crate::arch::cp0::status::KSU_USER
+            | crate::arch::cp0::status::FR
             | crate::arch::cp0::status::UX
             | crate::arch::cp0::status::EXL
             | crate::arch::cp0::status::IE
@@ -324,6 +325,9 @@ macro_rules! pop_registers {
     // back. EXL is already set by the first write, so no interrupt can
     // arrive with IE set and EXL not yet.
     ld      $8, 256($sp)
+    // FR (bit 26) on every return: the FPU register layout the userland uses.
+    lui     $9, 0x0400
+    or      $8, $8, $9
     addiu   $9, $zero, -2
     and     $9, $8, $9
     mtc0    $9, $12

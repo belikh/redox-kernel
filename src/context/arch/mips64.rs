@@ -104,7 +104,7 @@ impl super::Context {
     pub fn set_fx_regs(&mut self, new: FloatRegisters) {
         unsafe { self.kfx.as_mut_ptr().cast::<FloatRegisters>().write_unaligned(new) };
         if let Some(regs) = self.regs_mut() {
-            regs.iret.status |= cp0::status::CU1 as u64;
+            regs.iret.status |= (cp0::status::CU1 | cp0::status::FR) as u64;
         }
     }
 
@@ -179,7 +179,7 @@ fn frame_uses_fpu(context: &super::Context) -> bool {
 
 /// Save the FPU registers of the current context into `out`. Works with
 /// `CU1` off: it turns `CU1` on for the save, then restores the old Status.
-/// FR is 0, so the 16 even doubleword pairs hold all 32 single registers.
+/// FR is 1 (set with CU1 by the exception path): 32 doubleword registers.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
     core::arch::naked_asm!(
@@ -188,7 +188,7 @@ pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
         .set noat
         .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
         mfc0    $11, $12                // old Status
-        lui     $10, 0x2000             // CU1
+        lui     $10, 0x2400             // CU1 and FR (bit 26)
         or      $10, $11, $10
         mtc0    $10, $12
         nop
@@ -196,21 +196,37 @@ pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
         nop
         nop
         sdc1    $f0, 0($4)
-        sdc1    $f2, 8($4)
-        sdc1    $f4, 16($4)
-        sdc1    $f6, 24($4)
-        sdc1    $f8, 32($4)
-        sdc1    $f10, 40($4)
-        sdc1    $f12, 48($4)
-        sdc1    $f14, 56($4)
-        sdc1    $f16, 64($4)
-        sdc1    $f18, 72($4)
-        sdc1    $f20, 80($4)
-        sdc1    $f22, 88($4)
-        sdc1    $f24, 96($4)
-        sdc1    $f26, 104($4)
-        sdc1    $f28, 112($4)
-        sdc1    $f30, 120($4)
+        sdc1    $f1, 8($4)
+        sdc1    $f2, 16($4)
+        sdc1    $f3, 24($4)
+        sdc1    $f4, 32($4)
+        sdc1    $f5, 40($4)
+        sdc1    $f6, 48($4)
+        sdc1    $f7, 56($4)
+        sdc1    $f8, 64($4)
+        sdc1    $f9, 72($4)
+        sdc1    $f10, 80($4)
+        sdc1    $f11, 88($4)
+        sdc1    $f12, 96($4)
+        sdc1    $f13, 104($4)
+        sdc1    $f14, 112($4)
+        sdc1    $f15, 120($4)
+        sdc1    $f16, 128($4)
+        sdc1    $f17, 136($4)
+        sdc1    $f18, 144($4)
+        sdc1    $f19, 152($4)
+        sdc1    $f20, 160($4)
+        sdc1    $f21, 168($4)
+        sdc1    $f22, 176($4)
+        sdc1    $f23, 184($4)
+        sdc1    $f24, 192($4)
+        sdc1    $f25, 200($4)
+        sdc1    $f26, 208($4)
+        sdc1    $f27, 216($4)
+        sdc1    $f28, 224($4)
+        sdc1    $f29, 232($4)
+        sdc1    $f30, 240($4)
+        sdc1    $f31, 248($4)
         cfc1    $10, $31
         nop
         sw      $10, {fcsr}($4)
@@ -237,7 +253,7 @@ pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
         .set noat
         .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
         mfc0    $11, $12                // old Status
-        lui     $10, 0x2000             // CU1
+        lui     $10, 0x2400             // CU1 and FR (bit 26)
         or      $10, $11, $10
         mtc0    $10, $12
         nop
@@ -245,21 +261,37 @@ pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
         nop
         nop
         ldc1    $f0, 0($4)
-        ldc1    $f2, 8($4)
-        ldc1    $f4, 16($4)
-        ldc1    $f6, 24($4)
-        ldc1    $f8, 32($4)
-        ldc1    $f10, 40($4)
-        ldc1    $f12, 48($4)
-        ldc1    $f14, 56($4)
-        ldc1    $f16, 64($4)
-        ldc1    $f18, 72($4)
-        ldc1    $f20, 80($4)
-        ldc1    $f22, 88($4)
-        ldc1    $f24, 96($4)
-        ldc1    $f26, 104($4)
-        ldc1    $f28, 112($4)
-        ldc1    $f30, 120($4)
+        ldc1    $f1, 8($4)
+        ldc1    $f2, 16($4)
+        ldc1    $f3, 24($4)
+        ldc1    $f4, 32($4)
+        ldc1    $f5, 40($4)
+        ldc1    $f6, 48($4)
+        ldc1    $f7, 56($4)
+        ldc1    $f8, 64($4)
+        ldc1    $f9, 72($4)
+        ldc1    $f10, 80($4)
+        ldc1    $f11, 88($4)
+        ldc1    $f12, 96($4)
+        ldc1    $f13, 104($4)
+        ldc1    $f14, 112($4)
+        ldc1    $f15, 120($4)
+        ldc1    $f16, 128($4)
+        ldc1    $f17, 136($4)
+        ldc1    $f18, 144($4)
+        ldc1    $f19, 152($4)
+        ldc1    $f20, 160($4)
+        ldc1    $f21, 168($4)
+        ldc1    $f22, 176($4)
+        ldc1    $f23, 184($4)
+        ldc1    $f24, 192($4)
+        ldc1    $f25, 200($4)
+        ldc1    $f26, 208($4)
+        ldc1    $f27, 216($4)
+        ldc1    $f28, 224($4)
+        ldc1    $f29, 232($4)
+        ldc1    $f30, 240($4)
+        ldc1    $f31, 248($4)
         lw      $10, {fcsr}($4)
         nop
         ctc1    $10, $31

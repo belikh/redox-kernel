@@ -696,7 +696,7 @@ unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
             && regs.iret.status as u32 & cp0::status::CU1 == 0
         {
             crate::context::fp_load(&syscall::FloatRegisters::default());
-            regs.iret.status |= cp0::status::CU1 as u64;
+            regs.iret.status |= (cp0::status::CU1 | cp0::status::FR) as u64;
             return;
         }
 
