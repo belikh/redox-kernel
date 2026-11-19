@@ -319,7 +319,17 @@ macro_rules! pop_registers {
     mtlo    $8
     ld      $8, 248($sp)
     dmtc0   $8, $14
+    // Status takes effect three instructions late (interrupts sample it at
+    // stage 3). Write it with IE clear, wait out the window, then write IE
+    // back. EXL is already set by the first write, so no interrupt can
+    // arrive with IE set and EXL not yet.
     ld      $8, 256($sp)
+    addiu   $9, $zero, -2
+    and     $9, $8, $9
+    mtc0    $9, $12
+    nop
+    nop
+    nop
     mtc0    $8, $12
     nop
     nop

@@ -21,11 +21,13 @@ pub unsafe fn disable() {
 /// Performing enable followed by halt is not guaranteed to be atomic, use this instead!
 #[inline(always)]
 pub unsafe fn enable_and_halt() {
-    // The R4400 has no wait instruction: enabling interrupts and spinning is
-    // the closest thing. The first interrupt returns here.
+    // WAIT (COP0, CO=1, funct 0x20, word 0x42000020) stops the pipeline until
+    // an interrupt is requested. It takes effect only while the SysAD bus is
+    // idle, and otherwise does nothing, so the caller loops. An interrupt
+    // already pending when IE is set is taken before WAIT runs.
     unsafe {
-        enable_and_nop();
-        core::arch::asm!("nop", "nop", options(nomem, nostack));
+        cp0::write_status(cp0::read_status() | cp0::status::IE);
+        core::arch::asm!(".word 0x42000020", "nop", options(nomem, nostack));
     }
 }
 

@@ -1,5 +1,8 @@
 use crate::{
-    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
+    arch::{cp0, interrupt::InterruptStack},
+    context::context::Kstack,
+    memory::RmmA,
+    percpu::PercpuBlock,
     syscall::FloatRegisters,
 };
 use crate::arch::interrupt::handler::sign_extend;
@@ -88,12 +91,22 @@ impl Context {
 }
 
 impl super::Context {
+    /// The FPU registers of this context. Zero until its first FPU use.
     pub fn get_fx_regs(&self) -> FloatRegisters {
-        // TODO: the FPU is disabled (Status.CU1 = 0); userspace is soft float.
-        FloatRegisters::default()
+        if !frame_uses_fpu(self) {
+            return FloatRegisters::default();
+        }
+        unsafe { self.kfx.as_ptr().cast::<FloatRegisters>().read_unaligned() }
     }
 
-    pub fn set_fx_regs(&mut self, _new: FloatRegisters) {}
+    /// Set the FPU registers of this context and give it the FPU: its frame
+    /// gets `Status.CU1`, so it loads these on its next switch in.
+    pub fn set_fx_regs(&mut self, new: FloatRegisters) {
+        unsafe { self.kfx.as_mut_ptr().cast::<FloatRegisters>().write_unaligned(new) };
+        if let Some(regs) = self.regs_mut() {
+            regs.iret.status |= cp0::status::CU1 as u64;
+        }
+    }
 
     pub fn current_syscall(&self) -> Option<[usize; 7]> {
         if !self.inside_syscall {
@@ -155,9 +168,128 @@ pub unsafe fn empty_cr3() -> rmm::PhysicalAddress {
     }
 }
 
+/// Whether this context has used the FPU: its trap frame has `Status.CU1`.
+/// Such a context keeps its FPU registers in `kfx`, and a context without
+/// the bit has none, so its first FPU instruction traps and starts from zero.
+fn frame_uses_fpu(context: &super::Context) -> bool {
+    context
+        .regs()
+        .is_some_and(|regs| regs.iret.status as u32 & cp0::status::CU1 != 0)
+}
+
+/// Save the FPU registers of the current context into `out`. Works with
+/// `CU1` off: it turns `CU1` on for the save, then restores the old Status.
+/// FR is 0, so the 16 even doubleword pairs hold all 32 single registers.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
+    core::arch::naked_asm!(
+        "
+        .set noreorder
+        .set noat
+        .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
+        mfc0    $11, $12                // old Status
+        lui     $10, 0x2000             // CU1
+        or      $10, $11, $10
+        mtc0    $10, $12
+        nop
+        nop
+        nop
+        nop
+        sdc1    $f0, 0($4)
+        sdc1    $f2, 8($4)
+        sdc1    $f4, 16($4)
+        sdc1    $f6, 24($4)
+        sdc1    $f8, 32($4)
+        sdc1    $f10, 40($4)
+        sdc1    $f12, 48($4)
+        sdc1    $f14, 56($4)
+        sdc1    $f16, 64($4)
+        sdc1    $f18, 72($4)
+        sdc1    $f20, 80($4)
+        sdc1    $f22, 88($4)
+        sdc1    $f24, 96($4)
+        sdc1    $f26, 104($4)
+        sdc1    $f28, 112($4)
+        sdc1    $f30, 120($4)
+        cfc1    $10, $31
+        nop
+        sw      $10, {fcsr}($4)
+        mtc0    $11, $12
+        nop
+        nop
+        jr      $31
+        nop
+        .set softfloat
+        .set at
+        .set reorder
+        ",
+        fcsr = const offset_of!(FloatRegisters, fcsr),
+    )
+}
+
+/// Load the FPU registers of the current context from `src`, as `fp_save`
+/// stores them. The same `CU1` handling applies.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
+    core::arch::naked_asm!(
+        "
+        .set noreorder
+        .set noat
+        .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
+        mfc0    $11, $12                // old Status
+        lui     $10, 0x2000             // CU1
+        or      $10, $11, $10
+        mtc0    $10, $12
+        nop
+        nop
+        nop
+        nop
+        ldc1    $f0, 0($4)
+        ldc1    $f2, 8($4)
+        ldc1    $f4, 16($4)
+        ldc1    $f6, 24($4)
+        ldc1    $f8, 32($4)
+        ldc1    $f10, 40($4)
+        ldc1    $f12, 48($4)
+        ldc1    $f14, 56($4)
+        ldc1    $f16, 64($4)
+        ldc1    $f18, 72($4)
+        ldc1    $f20, 80($4)
+        ldc1    $f22, 88($4)
+        ldc1    $f24, 96($4)
+        ldc1    $f26, 104($4)
+        ldc1    $f28, 112($4)
+        ldc1    $f30, 120($4)
+        lw      $10, {fcsr}($4)
+        nop
+        ctc1    $10, $31
+        nop
+        nop
+        mtc0    $11, $12
+        nop
+        nop
+        jr      $31
+        nop
+        .set softfloat
+        .set at
+        .set reorder
+        ",
+        fcsr = const offset_of!(FloatRegisters, fcsr),
+    )
+}
+
 /// Switch to the next context by restoring its stack and registers
 pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
     unsafe {
+        // FPU registers belong to the context that used them last. Save the
+        // outgoing context's, and load the incoming one's if it has any.
+        if frame_uses_fpu(prev) {
+            fp_save(prev.kfx.as_mut_ptr().cast());
+        }
+        if frame_uses_fpu(next) {
+            fp_load(next.kfx.as_ptr().cast());
+        }
+
         PercpuBlock::current()
             .new_addrsp_tmp
             .set(next.addr_space.clone());

@@ -38,35 +38,76 @@ const VECTOR_GENERAL: usize = 0x8000_0180;
 /// workaround early R4600 revisions need for that operation.
 pub unsafe fn install_vectors() {
     unsafe {
-        for vector in [VECTOR_TLB_REFILL, VECTOR_XTLB_REFILL, VECTOR_GENERAL] {
-            // Refills go to the assembly handler, everything else to the
-            // general entry.
-            let stub = if vector == VECTOR_GENERAL {
-                vector_stub as usize
-            } else {
-                refill_stub as usize
-            } as *const u32;
-            let _ = (vector as *const u32).read_volatile();
-            core::arch::asm!(
-                "cache 21, 0({0})", // Hit_Writeback_Inv_D
-                in(reg) vector,
-                options(nostack)
-            );
-            let dst = (vector | 0x2000_0000) as *mut u32;
-            for i in 0..VECTOR_STUB_WORDS {
-                dst.add(i).write_volatile(stub.add(i).read_volatile());
-            }
-            core::arch::asm!(
-                "cache 16, 0({0})", // Hit_Invalidate_I
-                in(reg) vector,
-                options(nostack)
-            );
+        install_stub(VECTOR_TLB_REFILL, refill_stub as usize, VECTOR_STUB_WORDS);
+        install_stub(VECTOR_XTLB_REFILL, refill_stub as usize, VECTOR_STUB_WORDS);
+        install_stub(VECTOR_GENERAL, vector_stub as usize, VECTOR_STUB_WORDS);
+        install_stub(VECTOR_CACHE_ERROR, cache_error_stub as usize, CACHE_ERROR_STUB_WORDS);
+    }
+}
+
+/// Copy `words` instruction words from `stub` to the physical address behind
+/// `vector` (kseg0 address), writing through kseg1 as described above.
+unsafe fn install_stub(vector: usize, stub: usize, words: usize) {
+    unsafe {
+        let stub = stub as *const u32;
+        let _ = (vector as *const u32).read_volatile();
+        core::arch::asm!(
+            "cache 21, 0({0})", // Hit_Writeback_Inv_D
+            in(reg) vector,
+            options(nostack)
+        );
+        let dst = (vector | 0x2000_0000) as *mut u32;
+        for i in 0..words {
+            dst.add(i).write_volatile(stub.add(i).read_volatile());
         }
+        core::arch::asm!(
+            "cache 16, 0({0})", // Hit_Invalidate_I
+            in(reg) vector,
+            options(nostack)
+        );
     }
 }
 
 /// Instruction words in `vector_stub`.
 const VECTOR_STUB_WORDS: usize = 4;
+
+/// Cache error vector, used with `Status.BEV` clear: `0xA000_0100` is
+/// physical 0x100, uncached. The gap between the XTLB stub and the general
+/// vector holds it.
+const VECTOR_CACHE_ERROR: usize = 0x8000_0100;
+
+/// Instruction words in `cache_error_stub`.
+const CACHE_ERROR_STUB_WORDS: usize = 9;
+
+/// Where `cache_error_stub` records `CacheErr` and `ErrorEPC`: uncached
+/// words at physical 0x140 and 0x148, inside the same gap and below the
+/// general vector. Nothing prints them. Read them with `peek` in the
+/// bring-up shell, or in the debugger, before a reboot clears RAM.
+pub const CACHE_ERROR_RECORD: usize = 0xA000_0140;
+
+/// Record `CacheErr` and `ErrorEPC` and stop. A cache error leaves the cache
+/// in an unknown state, so the CPU spins with interrupts off instead of
+/// returning. The stub uses only uncached kseg1 addresses and k0/k1.
+#[unsafe(naked)]
+unsafe extern "C" fn cache_error_stub() {
+    naked_asm!(
+        "
+        .set noreorder
+        .set noat
+        lui     $26, 0xa000             // kseg1: uncached, unmapped
+        mfc0    $27, $27                // CacheErr
+        nop
+        sw      $27, 0x140($26)
+        dmfc0   $27, $30                // ErrorEPC
+        nop
+        sd      $27, 0x148($26)
+    1:  b       1b
+        nop
+        .set at
+        .set reorder
+        "
+    )
+}
 
 /// Position-independent: `la` expands to lui/ori with the absolute address.
 #[unsafe(naked)]
@@ -557,14 +598,112 @@ unsafe fn handle_system_exception(regs: &InterruptStack, exc_code: u32) {
     unsafe { crate::arch::stop::emergency_reset() }
 }
 
+/// Where the user instruction at EPC resumes after it was emulated or
+/// handled. Outside a delay slot that is the next word. In a delay slot
+/// (`Cause.BD` set, EPC names the branch), the slot has run, so the
+/// resume point is the branch outcome: the target when taken, the word
+/// after the slot when not.
+///
+/// The branch is decoded from the user's text and its registers come from
+/// the saved frame. The branch ran before the slot, so its inputs are the
+/// frame's values. `BC1F/BC1T` read FCR31 from the live FPU, which holds
+/// this thread's state because the branch executed with `CU1` on.
+unsafe fn resume_pc(regs: &InterruptStack) -> u64 {
+    let epc = regs.iret.epc;
+    if regs.iret.cause as u32 & cause::BD == 0 {
+        return epc + 4;
+    }
+    let slot = epc + 4;
+    let Some(branch) = read_user_insn(epc as usize) else {
+        return slot + 4;
+    };
+    let reg = |n: u32| -> u64 {
+        if n == 0 {
+            0
+        } else {
+            unsafe { (&raw const regs.registers as *const u64).add(n as usize - 1).read_unaligned() }
+        }
+    };
+    let op = branch >> 26;
+    let rs = (branch >> 21) & 31;
+    let rt = (branch >> 16) & 31;
+    let vs = reg(rs) as i64;
+    let vt = reg(rt) as i64;
+    let rel = slot.wrapping_add(((branch as u16 as i16) as i64 * 4) as u64);
+    let taken = match op {
+        // SPECIAL: JR and JALR jump to the register.
+        0 => match branch & 0x3f {
+            8 | 9 => return reg(rs),
+            _ => return unknown_slot(epc, slot),
+        },
+        // J and JAL: the region of the delay slot plus the 26-bit index.
+        2 | 3 => {
+            return (slot & 0xffff_ffff_f000_0000) | (((branch & 0x03ff_ffff) as u64) << 2);
+        }
+        // BEQ, BEQL, BNE, BNEL, BLEZ, BLEZL, BGTZ, BGTZL
+        4 | 20 => vs == vt,
+        5 | 21 => vs != vt,
+        6 | 22 => vs <= 0,
+        7 | 23 => vs > 0,
+        // REGIMM: BLTZ, BGEZ and their likely and link forms.
+        1 => match rt {
+            0 | 2 | 16 | 18 => vs < 0,
+            1 | 3 | 17 | 19 => vs >= 0,
+            _ => return unknown_slot(epc, slot),
+        },
+        // COP1 BC: rt 0 BC1F, 1 BC1T, 2 BC1FL, 3 BC1TL.
+        17 if rs == 8 => {
+            let cond = fcr31_condition();
+            if rt & 1 == 0 { !cond } else { cond }
+        }
+        _ => return unknown_slot(epc, slot),
+    };
+    if taken { rel } else { slot + 4 }
+}
+
+/// Read the FCR31 condition bit. Caller: a trap whose frame has `CU1` set.
+unsafe fn fcr31_condition() -> bool {
+    let fcr31: u32;
+    unsafe {
+        core::arch::asm!(
+            // cfc1 $2, $31, written as a word so the soft-float target
+            // assembles it.
+            ".word 0x4442f800",
+            "nop",
+            out("$2") fcr31,
+            options(nomem, nostack)
+        );
+    }
+    fcr31 & (1 << 23) != 0
+}
+
+/// A delay-slot fault whose branch this decoder does not know. Only
+/// possible for a corrupt text word, so log it and resume after the slot.
+fn unknown_slot(epc: u64, slot: u64) -> u64 {
+    warn!("delay slot at {epc:#x}: branch not decoded, resuming at {slot:#x}");
+    slot + 4
+}
+
 unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
     unsafe {
         let mut token = CleanLockToken::new();
 
+        // First FPU instruction of this context: its FPU registers start at
+        // zero. Give it the FPU (`CU1` in its frame), then retry the instruction.
+        // Later switches save and load the registers (context::arch::switch_to).
+        if exc_code == cause::EXC_CPU
+            && (regs.iret.cause as u32 >> 28) & 3 == 1
+            && regs.iret.status as u32 & cp0::status::CU1 == 0
+        {
+            crate::context::fp_load(&syscall::FloatRegisters::default());
+            regs.iret.status |= cp0::status::CU1 as u64;
+            return;
+        }
+
         if exc_code == cause::EXC_SYS {
+            // Resume after the syscall. In a delay slot, resume at the branch outcome.
+            regs.iret.epc = resume_pc(regs);
             let r = &mut regs.registers;
-            // Skip the syscall instruction. LLVM never places it in a branch delay slot.
-            regs.iret.epc += 4;
             // Kernel time per syscall number (buckets 32..96 of the stats).
             // One bucket per calling program, syscall number and first
             // argument (the file descriptor of a read or a write).
@@ -617,12 +756,15 @@ unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
         {
             let rt = ((insn >> 16) & 0x1f) as usize;
             let tp = regs.registers.gp;
+            // Work out the resume point before the write: a branch in a
+            // delay slot reads the registers the slot is about to change.
+            let resume = unsafe { resume_pc(regs) };
             if rt != 0 && rt != 26 && rt != 27 {
                 unsafe {
                     (&raw mut regs.registers as *mut u64).add(rt - 1).write(tp);
                 }
             }
-            regs.iret.epc += 4;
+            regs.iret.epc = resume;
             return;
         }
 

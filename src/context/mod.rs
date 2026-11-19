@@ -76,6 +76,10 @@ pub const CONTEXT_MAX_FILES: usize = 65_536;
 
 pub use self::arch::empty_cr3;
 
+/// Load FPU registers on the current CPU (MIPS: the first-use trap zeroes them).
+#[cfg(target_arch = "mips64")]
+pub(crate) use self::arch::fp_load;
+
 // Set of weak references to all contexts available for scheduling. The only strong references are
 // the context file descriptors.
 static CONTEXTS: RwLock<L2, BTreeSet<ContextRef>> = RwLock::new(BTreeSet::new());
